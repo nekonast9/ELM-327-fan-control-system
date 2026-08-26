@@ -21,20 +21,16 @@
 #define PWM_TOP ((F_CPU / (PWM_PRESCALER * FAN_FREQ)) - 1)
 
 /* --- Pin definitions --- */
-#define FAN_PIN             PB1 /* D9 (OC1A) */
-#define IGNITION_PIN        PD5 /* D5 */
-#define TEMP_SENSOR_CHANNEL 2   /* ADC0 (A0) */
+#define FAN_PIN                PB1 /* D9 (OC1A) */
+#define COMPRESSOR_RELAY_PIN   PB4 /* D12 */
+#define FAN_COMPRESSOR_ON_IDLE 60 // %
+#define FAN_COMPRESSOR_ON_3000 80 // %
 
 /* Settings */
-// #define ADC_MODE
-#define ELM_MODE
 // #define DISPLAY
 
-#ifdef ADC_MODE
-#define TEMPERATURE_TRIGGER_CORRECTION 5   /* Adjust calculated temperature by this value (positive or negative) */
-#endif
 #define WORK_AFTER_IGNITION_OFF_TIMEOUT_MS 30000 /* Time to keep working after ignition is turned off */
-
+#define IGNITION_OFF_OBD_TIMEOUT_MS        8000  /* Max OBD silence before declaring ignition off */
 
 /* Functions */
 
@@ -45,8 +41,8 @@ void initHardware(void) {
     DDRB |= (1 << FAN_PIN);
 
     /* INPUT */
-    DDRD &= ~(1 << IGNITION_PIN);
-    PORTD |= (1 << IGNITION_PIN);
+    DDRB &= ~(1 << COMPRESSOR_RELAY_PIN);
+    PORTB |= (1 << COMPRESSOR_RELAY_PIN);
 
     /* Timer1: Mode 14 (Fast PWM), TOP = ICR1 */
     /* COM1A1: Non-inverting PWM on OC1A */
@@ -69,16 +65,6 @@ void setFanPower(uint8_t percent) {
     OCR1A = ((uint32_t)inverted_percent * PWM_TOP) / 100;
 }
 
-float calculateJeepTemp(int adcValue) {
-  const float a = 0.0001651;
-  const float b = -0.2524;
-  const float c = 142.61;
-
-  /* T = a*x^2 + b*x + c */
-  float temp = (a * adcValue * adcValue) + (b * adcValue) + c;
-
-  return temp;
-}
 uint8_t calculateFanP(float currentTemp) {
     const float T_LOW  = 96.0;
     const float T_HIGH = 106.0;
@@ -109,6 +95,10 @@ uint8_t calculateFanP(float currentTemp) {
     return (uint8_t)power;
 }
 
+bool isCompressorOn(void) {
+    return !!(PINB & (1 << COMPRESSOR_RELAY_PIN));
+}
+
 typedef enum {
     MODE_AUTO,
     MODE_MANUAL
@@ -117,73 +107,63 @@ typedef enum {
 fan_mode_t currentMode = MODE_AUTO;
 uint8_t manualPower = 0;
 
-char cmdBuffer[32];
-uint8_t cmdIndex = 0;
 
 int main(void) {
-#ifdef ADC_MODE
-    uint16_t adc_raw_temp = 0;
-#endif
     float jeepTemp = 0.0;
+    float last_valid_temp = 0.0;
     uint8_t fanPower = 0;
     bool ignitionOn = false;
-    size_t last_ignition_time_off = 0;
+    uint32_t last_ignition_time_off = 0;
+    uint32_t last_valid_obd_ms = 0;
 
     initHardware();
     uart_init();
     softuart_init();
     millis_init();
-#ifdef ADC_MODE
-    adc_init();
-#endif
 
     sei();            /* Enable Global Interrupts */
 
     while (1) {
         // processNextionInput();
 
-#ifdef ADC_MODE
-        adc_raw_temp = adc_read(TEMP_SENSOR_CHANNEL);
+        int16_t temp_raw = elm327_get_coolant_temp();
+        int16_t rpm = ELM327_FAIL;
+        bool rpm_fetched = false;
 
-        if(!(PIND & (1 << IGNITION_PIN))) {
-            if (!ignitionOn) {
-                printf("Ignition changed to on...\n");
-                ignitionOn = true;
-            }
-        } else {
-            if (ignitionOn) {
-                printf("Ignition changed to off...\n");
-                last_ignition_time_off = millis();
-                ignitionOn = false;
-            }
-        }
-
-        ignitionOn = true;
-#endif
-
-#ifdef ELM_MODE
-        jeepTemp = elm327_get_coolant_temp();
-
-        if (jeepTemp == ELM327_DISCONNECTED || jeepTemp == ELM327_FAIL) {
+        if (temp_raw == ELM327_DISCONNECTED || temp_raw == ELM327_FAIL) {
             printf("ELM327 failed to provide temperature\n");
-            jeepTemp = 0.0;
+            jeepTemp = last_valid_temp;
 
-            if (ignitionOn) {
-                printf("Ignition changed to off...\n");
-                last_ignition_time_off = millis();
-                ignitionOn = false;
+            rpm = elm327_get_rpm();
+            rpm_fetched = true;
+            printf("RPM: %d\n", rpm);
+
+            if (rpm > 0) {
+                last_valid_obd_ms = millis();
+                if (!ignitionOn) {
+                    printf("Ignition changed to on...\n");
+                    ignitionOn = true;
+                }
             }
 
         } else {
+            last_valid_temp = (float)temp_raw;
+            jeepTemp = last_valid_temp;
+            last_valid_obd_ms = millis();
             if (!ignitionOn) {
                 printf("Ignition changed to on...\n");
                 ignitionOn = true;
             }
         }
-#endif
+
+        if (ignitionOn && (millis() - last_valid_obd_ms) > IGNITION_OFF_OBD_TIMEOUT_MS) {
+            printf("Ignition changed to off...\n");
+            last_ignition_time_off = millis();
+            ignitionOn = false;
+        }
 
         if (!ignitionOn && (millis() - last_ignition_time_off) < WORK_AFTER_IGNITION_OFF_TIMEOUT_MS) {
-            printf("Ignition is off, but still working for %lu ms...\n", WORK_AFTER_IGNITION_OFF_TIMEOUT_MS - (millis() - last_ignition_time_off));
+            printf("Ignition is off, but still working for %lu ms... Fan: %d%%\n", WORK_AFTER_IGNITION_OFF_TIMEOUT_MS - (millis() - last_ignition_time_off), fanPower);
             _delay_ms(1000);
             continue;
         } else if (!ignitionOn) {
@@ -193,35 +173,42 @@ int main(void) {
             continue;
         }
 
-#ifdef ADC_MODE
-        jeepTemp = calculateJeepTemp(adc_raw_temp);
-        jeepTemp += TEMPERATURE_TRIGGER_CORRECTION;
-#endif
-
         if (currentMode == MODE_AUTO) {
             fanPower = calculateFanP(jeepTemp);
         } else {
             fanPower = manualPower;
         }
 
+        bool compressor_on = isCompressorOn();
+        printf("Compressor: %s\n", compressor_on ? "ON" : "OFF");
+
+        if (!rpm_fetched) {
+            rpm = elm327_get_rpm();
+            printf("RPM: %d\n", rpm);
+        }
+
+        if (compressor_on) {
+            if (rpm < 3000) {
+                if (fanPower < FAN_COMPRESSOR_ON_IDLE) {
+                    fanPower = FAN_COMPRESSOR_ON_IDLE;
+                }
+            } else {
+                if (fanPower < FAN_COMPRESSOR_ON_3000) {
+                    fanPower = FAN_COMPRESSOR_ON_3000;
+                }
+            }
+        }
+
         setFanPower(fanPower);
 
-    #ifdef DISPLAY
-        printf("num_temp.val=%d\xFF\xFF\xFF", (int)jeepTemp);
-        printf("num_karlson.val=%d\xFF\xFF\xFF", (int)fanPower);
-    #endif
-
-#ifdef ADC_MODE
-        printf("Temp: %d, Fan: %d%%, Mode: %s, ADC=%u\n",
-               (int)jeepTemp, fanPower, (currentMode == MODE_AUTO ? "AUTO" : "MANUAL"), adc_raw_temp);
-#endif
-
-#ifdef ELM_MODE
         printf("Temp: %d, Fan: %d%%, Mode: %s\n",
                (int)jeepTemp, fanPower, (currentMode == MODE_AUTO ? "AUTO" : "MANUAL"));
-#endif
 
-        _delay_ms(3000);
+        if (compressor_on) {
+            _delay_ms(1000);
+        } else {
+            _delay_ms(3000);
+        }
     }
 
     return 0;

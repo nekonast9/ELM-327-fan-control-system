@@ -2,6 +2,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <millis.h>
 
 #define ELM_SEND_P(cmd_str) softuart_puts_P(cmd_str "\r\n")
@@ -98,9 +99,74 @@ extern int16_t elm327_get_coolant_temp(void) {
 
         printf("[OBD][get_coolant_temp] Found 4105! Hex: %s, Dec: %d, Temp: %d C\n", temp_hex, raw_val, result);
 
+        softuart_flush_input_buffer();
         return result;
     }
 
     printf("[OBD][get_coolant_temp] Error: Header 4105 not found in response\n");
+
+    softuart_flush_input_buffer();
+    return ELM327_FAIL;
+}
+
+extern int16_t elm327_get_rpm(void) {
+    char buf[ELM327_BUFFER_SIZE];
+    char raw_buf[ELM327_BUFFER_SIZE];
+    char rpm_hex[5] = {0};
+    char *ptr = NULL;
+    uint8_t i_buf = 0;
+    uint8_t i_raw_buf = 0;
+    uint32_t start = 0;
+
+    elm327_update_state();
+
+    if (current_elm327_state != ELM327_STATE_READY) {
+        printf("[OBD][get_rpm] Error: ELM327 not ready. State: %d\n", current_elm327_state);
+        return ELM327_DISCONNECTED;
+    }
+
+    softuart_flush_input_buffer();
+    softuart_puts_P("010C\r");
+
+    start = millis();
+
+    while (millis() - start < ELM327_CMD_TIMEOUT_MS && i_raw_buf < ELM327_BUFFER_SIZE - 1) {
+        if (softuart_kbhit()) {
+            char c = softuart_getchar();
+            if (c == '>') break;
+            if (c != ' ' && c != '\r' && c != '\n' && c != '\0') {
+                raw_buf[i_raw_buf++] = c;
+            }
+            if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F')) {
+                buf[i_buf++] = c;
+            }
+        }
+    }
+    buf[i_buf] = '\0';
+    raw_buf[i_raw_buf] = '\0';
+
+    if (i_raw_buf > 0) {
+        printf("[OBD][get_rpm] Raw Data: %s\n", raw_buf);
+    } else {
+        printf("[OBD][get_rpm] Error: No response (Timeout)\n");
+        return ELM327_FAIL;
+    }
+
+    ptr = strstr(buf, "410C");
+    if (ptr) {
+        strncpy(rpm_hex, ptr + 4, 4);
+        rpm_hex[4] = '\0';
+
+        uint32_t raw_val = (uint32_t)strtol(rpm_hex, NULL, 16);
+        int16_t result = (int16_t)(raw_val / 4);
+
+        printf("[OBD][get_rpm] Found 410C! Hex: %s, Dec: %lu, RPM: %d\n", rpm_hex, raw_val, result);
+
+        return result;
+    }
+
+    printf("[OBD][get_rpm] Error: Header 410C not found in response\n");
+
+    softuart_flush_input_buffer();
     return ELM327_FAIL;
 }
